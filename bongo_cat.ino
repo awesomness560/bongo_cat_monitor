@@ -21,8 +21,8 @@ const int daylightOffset_sec = 3600;   // 1 hour for daylight saving
 
 // Configuration settings structure - simplified for time-only display
 struct BongoCatSettings {
-    bool time_format_24h = false;
     int sleep_timeout_minutes = 5;
+    bool daylight_savings_enabled = true;  // DST toggle
     uint32_t checksum = 0;  // For validation
 };
 
@@ -34,16 +34,32 @@ struct BongoCatSettings {
 // Global settings instance
 BongoCatSettings settings;
 
+// Forward declarations
+void saveSettings();
+void resetSettings();
+void updateTimeDisplay();
+void createBongoCat();
+
 TFT_eSPI tft = TFT_eSPI();
 
 // LVGL display buffer
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t buf[SCREEN_WIDTH * 10];
 
+// Touch input
+static lv_indev_drv_t indev_drv;
+
 // Animation system with sprites
 sprite_manager_t sprite_manager;
 lv_obj_t * cat_canvas = NULL;
 uint32_t last_frame_time = 0;
+
+// Touch interaction timing
+uint32_t last_touch_time = 0;
+uint32_t excited_start_time = 0;
+bool is_excited = false;
+#define EXCITED_DURATION_MS 60000  // 1 minute of excitement
+#define AUTO_CYCLE_DURATION_MS 600000  // 10 minutes = 600,000 ms
 
 // Cat positioning
 #define CAT_SIZE 64   // Base sprite size - will be zoomed 4x for display
@@ -69,6 +85,104 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
     lv_disp_flush_ready(disp);
 }
 
+// Touch input callback
+void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
+    uint16_t touchX, touchY;
+    
+    bool touched = tft.getTouch(&touchX, &touchY);
+    
+    if (touched) {
+        data->state = LV_INDEV_STATE_PR;
+        data->point.x = touchX;
+        data->point.y = touchY;
+
+        Serial.println(String(touchX) + ", " + String(touchY));
+        
+        // Check if touch is below y=75 (time/DST toggle area) or above y=75 (cat excitement area)
+        bool touched_time_area = (touchY < 75);  // Below y=75 toggles daylight savings
+        
+        if (touched_time_area) {
+            // Touch below y=75 - toggle daylight savings
+            Serial.println("🕐 Time area touched (y<75) - Toggling daylight savings!");
+            bool old_dst_setting = settings.daylight_savings_enabled;
+            settings.daylight_savings_enabled = !settings.daylight_savings_enabled;
+            saveSettings();
+            
+            // Calculate the time adjustment needed
+            int time_adjustment_hours = 0;
+            if (old_dst_setting && !settings.daylight_savings_enabled) {
+                // DST was ON, now OFF - subtract 1 hour
+                time_adjustment_hours = -1;
+            } else if (!old_dst_setting && settings.daylight_savings_enabled) {
+                // DST was OFF, now ON - add 1 hour
+                time_adjustment_hours = 1;
+            }
+            
+            // Get current time and manually adjust it
+            struct tm timeinfo;
+            if (getLocalTime(&timeinfo)) {
+                // Adjust the hour
+                timeinfo.tm_hour += time_adjustment_hours;
+                
+                // Handle hour overflow/underflow
+                if (timeinfo.tm_hour >= 24) {
+                    timeinfo.tm_hour -= 24;
+                    timeinfo.tm_mday += 1; // Next day
+                } else if (timeinfo.tm_hour < 0) {
+                    timeinfo.tm_hour += 24;
+                    timeinfo.tm_mday -= 1; // Previous day
+                }
+                
+                // Convert back to time_t and set system time
+                time_t adjusted_time = mktime(&timeinfo);
+                struct timeval tv = { .tv_sec = adjusted_time, .tv_usec = 0 };
+                settimeofday(&tv, NULL);
+                
+                Serial.println("⏰ Daylight Savings: " + String(settings.daylight_savings_enabled ? "ON" : "OFF"));
+                Serial.println("🔄 Time adjusted by " + String(time_adjustment_hours) + " hour(s)");
+                
+                // Update time configuration for future NTP syncs
+                int current_dst_offset = settings.daylight_savings_enabled ? daylightOffset_sec : 0;
+                configTime(gmtOffset_sec, current_dst_offset, ntpServer);
+                
+                // Force display update
+                updateTimeDisplay();
+                
+                // Print new time for verification
+                if (getLocalTime(&timeinfo)) {
+                    char timeStr[20];
+                    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+                    Serial.println("🕐 New time: " + String(timeStr));
+                }
+            } else {
+                Serial.println("❌ Failed to get current time for DST adjustment");
+            }
+        } else {
+            // Touch above y=75 - trigger cat excitement
+            uint32_t current_time = millis();
+            
+            Serial.println("👆 Cat area touched (y>=75) at: (" + String(touchX) + ", " + String(touchY) + ") - Getting excited!");
+            
+            // If sleeping, wake up to idle first
+            if (sprite_manager.current_state == ANIM_STATE_IDLE_STAGE4) {
+                Serial.println("😴➡️😐 Waking up from sleep!");
+                sprite_manager_set_state(&sprite_manager, ANIM_STATE_IDLE_STAGE1, current_time);
+            } else {
+                // Switch to excited state
+                Serial.println("😐➡️😊 Getting excited!");
+                sprite_manager_set_state(&sprite_manager, ANIM_STATE_TYPING_FAST, current_time);  // Use fast typing as "excited"
+                sprite_manager.is_streak_mode = true;  // Happy face
+                is_excited = true;
+                excited_start_time = current_time;
+            }
+            
+            last_touch_time = current_time;
+        }
+    } else {
+        data->state = LV_INDEV_STATE_REL;
+    }
+}
+
 // Update time display  
 void updateTimeDisplay() {
     if (time_label) {
@@ -78,30 +192,29 @@ void updateTimeDisplay() {
             // Get current time from system
             struct tm timeinfo;
             if (getLocalTime(&timeinfo)) {
-                char timeStr[6];
-                strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
-                display_time = String(timeStr);
+                // Always use 12-hour format with AM/PM
+                int hour = timeinfo.tm_hour;
+                String minute = String(timeinfo.tm_min < 10 ? "0" : "") + String(timeinfo.tm_min);
+                String ampm = (hour >= 12) ? "PM" : "AM";
                 
-                // Convert to 12-hour format if needed
-                if (!settings.time_format_24h) {
-                    int hour = timeinfo.tm_hour;
-                    String minute = String(timeinfo.tm_min < 10 ? "0" : "") + String(timeinfo.tm_min);
-                    String ampm = (hour >= 12) ? "PM" : "AM";
-                    
-                    if (hour == 0) hour = 12;      // 00:xx -> 12:xx AM
-                    else if (hour > 12) hour -= 12; // 13:xx -> 1:xx PM
-                    
-                    display_time = String(hour) + ":" + minute + " " + ampm;
+                if (hour == 0) hour = 12;      // 00:xx -> 12:xx AM
+                else if (hour > 12) hour -= 12; // 13:xx -> 1:xx PM
+                
+                display_time = String(hour) + ":" + minute + " " + ampm;
+                
+                // Debug output (only print occasionally to avoid spam)
+                static uint32_t last_debug = 0;
+                if (millis() - last_debug > 10000) { // Every 10 seconds
+                    Serial.println("🕐 Display time: " + display_time + " (from system time)");
+                    last_debug = millis();
                 }
             } else {
-                display_time = current_time_str; // Fallback to static time
+                display_time = "12:34 PM"; // Fallback to static time with AM/PM
+                Serial.println("⚠️ getLocalTime() failed, using fallback");
             }
         } else {
-            // Use static fallback time
-            display_time = current_time_str;
-            
-            // Convert static time to 12-hour format if needed
-            if (!settings.time_format_24h && current_time_str.length() == 5) {
+            // Use static fallback time - always convert to 12-hour format
+            if (current_time_str.length() == 5) {
                 int hour = current_time_str.substring(0, 2).toInt();
                 String minute = current_time_str.substring(3, 5);
                 String ampm = (hour >= 12) ? "PM" : "AM";
@@ -110,7 +223,10 @@ void updateTimeDisplay() {
                 else if (hour > 12) hour -= 12; // 13:xx -> 1:xx PM
                 
                 display_time = String(hour) + ":" + minute + " " + ampm;
+            } else {
+                display_time = "12:34 PM"; // Default fallback
             }
+            Serial.println("⚠️ Using fallback time: " + display_time);
         }
         
         lv_label_set_text(time_label, display_time.c_str());
@@ -137,7 +253,8 @@ void syncTimeFromWiFi() {
         
         // Configure time
         Serial.println("🕐 Syncing time from NTP server...");
-        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+        int current_dst_offset = settings.daylight_savings_enabled ? daylightOffset_sec : 0;
+        configTime(gmtOffset_sec, current_dst_offset, ntpServer);
         
         // Wait for time sync (up to 5 seconds)
         struct tm timeinfo;
@@ -212,8 +329,8 @@ void loadSettings() {
 
 void resetSettings() {
     // Reset to default values
-    settings.time_format_24h = true;
     settings.sleep_timeout_minutes = 5;
+    settings.daylight_savings_enabled = true;  // Default DST on
     settings.checksum = calculateChecksum(&settings);
 }
 
@@ -280,33 +397,90 @@ void calculateSleepStageTiming(int timeout_minutes, unsigned long* stage1_ms, un
 }
 
 void sprite_manager_update(sprite_manager_t* manager, uint32_t current_time) {
-    // Standalone mode - automatic idle progression
-    if (manager->idle_progression_enabled) {
-        // Calculate adaptive timing based on current sleep timeout setting
-        unsigned long stage1_duration, stage2_duration, stage3_duration;
-        calculateSleepStageTiming(settings.sleep_timeout_minutes, &stage1_duration, &stage2_duration, &stage3_duration);
+    // Handle excited state timeout
+    if (is_excited && current_time - excited_start_time > EXCITED_DURATION_MS) {
+        Serial.println("😊➡️😐 Excitement over, back to idle");
+        is_excited = false;
+        manager->is_streak_mode = false;  // Remove happy face
+        sprite_manager_set_state(manager, ANIM_STATE_IDLE_STAGE1, current_time);
+    }
+    
+    // Handle automatic sleep/wake cycling (10 minutes)
+    if (!is_excited && manager->idle_progression_enabled) {
+        uint32_t time_in_current_state = current_time - manager->state_start_time;
         
-        if (manager->current_state == ANIM_STATE_IDLE_STAGE1) {
-            if (current_time - manager->state_start_time > stage1_duration) {
-                sprite_manager_set_state(manager, ANIM_STATE_IDLE_STAGE2, current_time);
-            }
-        } else if (manager->current_state == ANIM_STATE_IDLE_STAGE2) {
-            if (current_time - manager->state_start_time > stage2_duration) {
-                sprite_manager_set_state(manager, ANIM_STATE_IDLE_STAGE3, current_time);
-            }
-        } else if (manager->current_state == ANIM_STATE_IDLE_STAGE3) {
-            if (current_time - manager->state_start_time > stage3_duration) {
+        // Auto cycle between idle and sleep every 10 minutes
+        if (time_in_current_state > AUTO_CYCLE_DURATION_MS) {
+            if (manager->current_state == ANIM_STATE_IDLE_STAGE4) {
+                // Been sleeping for 10 minutes, wake up
+                Serial.println("💤➡️😐 Auto wake up after 10 minutes of sleep");
+                sprite_manager_set_state(manager, ANIM_STATE_IDLE_STAGE1, current_time);
+            } else if (manager->current_state == ANIM_STATE_IDLE_STAGE1) {
+                // Been idle for 10 minutes, go to sleep
+                Serial.println("😐➡️💤 Auto sleep after 10 minutes of idle");
                 sprite_manager_set_state(manager, ANIM_STATE_IDLE_STAGE4, current_time);
+            }
+        }
+        
+        // Original idle progression (but faster when not in auto-cycle mode)
+        if (!is_excited) {
+            // Calculate adaptive timing based on current sleep timeout setting
+            unsigned long stage1_duration, stage2_duration, stage3_duration;
+            calculateSleepStageTiming(settings.sleep_timeout_minutes, &stage1_duration, &stage2_duration, &stage3_duration);
+            
+            if (manager->current_state == ANIM_STATE_IDLE_STAGE1 && time_in_current_state < AUTO_CYCLE_DURATION_MS) {
+                if (time_in_current_state > stage1_duration) {
+                    sprite_manager_set_state(manager, ANIM_STATE_IDLE_STAGE2, current_time);
+                }
+            } else if (manager->current_state == ANIM_STATE_IDLE_STAGE2) {
+                if (time_in_current_state > stage2_duration) {
+                    sprite_manager_set_state(manager, ANIM_STATE_IDLE_STAGE3, current_time);
+                }
+            } else if (manager->current_state == ANIM_STATE_IDLE_STAGE3) {
+                if (time_in_current_state > stage3_duration) {
+                    sprite_manager_set_state(manager, ANIM_STATE_IDLE_STAGE4, current_time);
+                }
             }
         }
     }
     
-    // Handle paw positioning based on state
-    if (manager->current_state == ANIM_STATE_IDLE_STAGE1) {
-        manager->current_sprites[LAYER_PAWS] = &twopawsup;  // Visible paws for stage 1
-    } else if (manager->current_state >= ANIM_STATE_IDLE_STAGE2 && 
-               manager->current_state <= ANIM_STATE_IDLE_STAGE4) {
-        manager->current_sprites[LAYER_PAWS] = NULL;  // Hidden paws for stages 2-4
+    // Handle paw animations for excited state
+    if (is_excited && manager->current_state == ANIM_STATE_TYPING_FAST) {
+        manager->paw_animation_active = true;
+        
+        if (current_time - manager->paw_timer >= 100) {  // Fast animation for excitement
+            manager->paw_frame = (manager->paw_frame + 1) % 4;  // 4-step pattern
+            
+            switch (manager->paw_frame) {
+                case 0:  // Left paw down
+                    manager->current_sprites[LAYER_PAWS] = &leftpawdown;
+                    manager->current_sprites[LAYER_EFFECTS] = &left_click_effect;
+                    break;
+                case 1:  // Both paws up (rest position)
+                    manager->current_sprites[LAYER_PAWS] = &twopawsup;
+                    manager->current_sprites[LAYER_EFFECTS] = NULL;
+                    break;
+                case 2:  // Right paw down  
+                    manager->current_sprites[LAYER_PAWS] = &rightpawdown;
+                    manager->current_sprites[LAYER_EFFECTS] = &right_click_effect;
+                    break;
+                case 3:  // Both paws up (rest position)
+                    manager->current_sprites[LAYER_PAWS] = &twopawsup;
+                    manager->current_sprites[LAYER_EFFECTS] = NULL;
+                    break;
+            }
+            manager->paw_timer = current_time;
+        }
+    } else {
+        // Handle normal paw positioning based on state
+        manager->paw_animation_active = false;
+        
+        if (manager->current_state == ANIM_STATE_IDLE_STAGE1) {
+            manager->current_sprites[LAYER_PAWS] = &twopawsup;  // Visible paws for stage 1
+        } else if (manager->current_state >= ANIM_STATE_IDLE_STAGE2 && 
+                   manager->current_state <= ANIM_STATE_IDLE_STAGE4) {
+            manager->current_sprites[LAYER_PAWS] = NULL;  // Hidden paws for stages 2-4
+        }
     }
     
     // Handle sleepy effects animation (for IDLE_STAGE4)
@@ -320,13 +494,13 @@ void sprite_manager_update(sprite_manager_t* manager, uint32_t current_time) {
             }
             manager->effect_timer = current_time;
         }
-    } else {
+    } else if (!is_excited) {
         manager->current_sprites[LAYER_EFFECTS] = NULL;  // Clear effects for other states
     }
     
-    // Handle automatic blinking (only when awake, not during sleep)
+    // Handle automatic blinking (only when awake, not during sleep or excitement)
     bool can_blink = (manager->current_state != ANIM_STATE_IDLE_STAGE3 && 
-                      manager->current_state != ANIM_STATE_IDLE_STAGE4);
+                      manager->current_state != ANIM_STATE_IDLE_STAGE4 && !is_excited);
     
     if (!manager->blinking && current_time >= manager->blink_timer && can_blink) {
         // Start blink
@@ -340,6 +514,8 @@ void sprite_manager_update(sprite_manager_t* manager, uint32_t current_time) {
         if (manager->current_state == ANIM_STATE_IDLE_STAGE3 || 
             manager->current_state == ANIM_STATE_IDLE_STAGE4) {
             manager->current_sprites[LAYER_FACE] = &sleepy_face;
+        } else if (is_excited || manager->is_streak_mode) {
+            manager->current_sprites[LAYER_FACE] = &happy_face;  // Happy face when excited
         } else {
             manager->current_sprites[LAYER_FACE] = &stock_face;  // Default face
         }
@@ -352,7 +528,9 @@ void sprite_manager_update(sprite_manager_t* manager, uint32_t current_time) {
         }
     }
     
-    // Handle ear twitch
+    // Handle ear twitch (less frequent when excited)
+    uint32_t ear_twitch_interval = is_excited ? 30000 : 15000;  // Less twitching when excited
+    
     if (!manager->ear_twitching && current_time >= manager->ear_twitch_timer) {
         // Start ear twitch
         manager->ear_twitching = true;
@@ -363,7 +541,7 @@ void sprite_manager_update(sprite_manager_t* manager, uint32_t current_time) {
         manager->ear_twitching = false;
         manager->current_sprites[LAYER_BODY] = &standardbody1;
         // Set next ear twitch time
-        manager->ear_twitch_timer = current_time + random(10000, 30000);
+        manager->ear_twitch_timer = current_time + random(10000, ear_twitch_interval);
     }
 }
 
@@ -403,6 +581,14 @@ void sprite_manager_set_state(sprite_manager_t* manager, animation_state_t new_s
             manager->current_sprites[LAYER_FACE] = &sleepy_face;
             manager->effect_timer = current_time;
             manager->effect_frame = 0;
+            break;
+            
+        case ANIM_STATE_TYPING_FAST:
+            // Excited state: Happy face with paws moving and effects
+            manager->current_sprites[LAYER_PAWS] = &twopawsup;  // Will be animated in update
+            manager->current_sprites[LAYER_EFFECTS] = NULL;     // Will be animated in update
+            manager->current_sprites[LAYER_FACE] = &happy_face;
+            manager->paw_animation_active = true;
             break;
             
         default:
@@ -475,6 +661,12 @@ void setup() {
     disp_drv.flush_cb = my_disp_flush;
     disp_drv.draw_buf = &draw_buf;
     lv_disp_drv_register(&disp_drv);
+    
+    // Initialize touch input
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = my_touchpad_read;
+    lv_indev_drv_register(&indev_drv);
     
     // Initialize sprite manager
     sprite_manager_init(&sprite_manager);
