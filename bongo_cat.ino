@@ -167,6 +167,15 @@ void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
             if (sprite_manager.current_state == ANIM_STATE_IDLE_STAGE4) {
                 Serial.println("😴➡️😐 Waking up from sleep!");
                 sprite_manager_set_state(&sprite_manager, ANIM_STATE_IDLE_STAGE1, current_time);
+            } else if (is_excited) {
+                // Cat is already excited - control brightness instead
+                static int brightness_level = 255;  // Start at full brightness
+                brightness_level -= 25;  // Decrease by 25 each touch
+                if (brightness_level < 50) brightness_level = 255;  // Reset to full when too dim
+                
+                // Set TFT brightness (0-255)
+                analogWrite(TFT_BL, brightness_level);  // Assuming TFT_BL is the backlight pin
+                Serial.println("🔆 Cat is excited - Brightness set to: " + String(brightness_level) + "/255");
             } else {
                 // Switch to excited state
                 Serial.println("😐➡️😊 Getting excited!");
