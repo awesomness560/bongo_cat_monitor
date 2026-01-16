@@ -14,7 +14,7 @@ struct WiFiNetwork {
 
 // Add your WiFi networks here - it will try them in order
 WiFiNetwork wifiNetworks[] = {
-    {"Wifi name", "passwrd"},           // Home network
+    {"Wifi Name", "Wifi Password"},           // Home network
 };
 const int numWiFiNetworks = sizeof(wifiNetworks) / sizeof(wifiNetworks[0]);
 
@@ -63,6 +63,8 @@ void saveSettings();
 void resetSettings();
 void updateTimeDisplay();
 void createBongoCat();
+void setDisplaySleep(bool sleep);
+void wakeUpDisplay();
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -82,6 +84,14 @@ uint32_t last_frame_time = 0;
 uint32_t last_touch_time = 0;
 uint32_t excited_start_time = 0;
 bool is_excited = false;
+
+// Display sleep functionality
+bool display_sleeping = false;
+uint32_t touch_hold_start_time = 0;
+bool touch_currently_held = false;
+bool just_went_to_sleep = false;  // Flag to prevent immediate wake up
+#define HOLD_TO_SLEEP_DURATION_MS 5000  // 5 seconds to turn off display
+
 #define EXCITED_DURATION_MS 60000  // 1 minute of excitement
 #define AUTO_CYCLE_DURATION_MS 600000  // 10 minutes = 600,000 ms
 
@@ -115,6 +125,7 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
 // Touch input callback
 void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
     uint16_t touchX, touchY;
+    uint32_t current_time = millis();
     
     bool touched = tft.getTouch(&touchX, &touchY);
     
@@ -123,84 +134,131 @@ void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
         data->point.x = touchX;
         data->point.y = touchY;
 
-        Serial.println(String(touchX) + ", " + String(touchY));
-        
-        // Check if touch is below y=75 (time/DST toggle area) or above y=75 (cat excitement area)
-        bool touched_time_area = (touchY < 75);  // Below y=75 toggles daylight savings
-        
-        if (touched_time_area) {
-            // Touch below y=75 - cycle through common US timezones
-            Serial.println("🕐 Time area touched (y<75) - Cycling timezone!");
-            
-            // Cycle through common US timezones
-            if (strcmp(settings.timezone_string, "CST6CDT,M3.2.0,M11.1.0") == 0) {
-                strcpy(settings.timezone_string, "EST5EDT,M3.2.0,M11.1.0");  // Eastern
-                Serial.println("⏰ Switched to Eastern Time");
-            } else if (strcmp(settings.timezone_string, "EST5EDT,M3.2.0,M11.1.0") == 0) {
-                strcpy(settings.timezone_string, "MST7MDT,M3.2.0,M11.1.0");  // Mountain
-                Serial.println("⏰ Switched to Mountain Time");
-            } else if (strcmp(settings.timezone_string, "MST7MDT,M3.2.0,M11.1.0") == 0) {
-                strcpy(settings.timezone_string, "PST8PDT,M3.2.0,M11.1.0");  // Pacific
-                Serial.println("⏰ Switched to Pacific Time");
+        // If display is sleeping, only wake up on a fresh tap (not the same touch that put it to sleep)
+        if (display_sleeping) {
+            if (just_went_to_sleep) {
+                // Ignore touches immediately after going to sleep
+                return;
             } else {
-                strcpy(settings.timezone_string, "CST6CDT,M3.2.0,M11.1.0");  // Back to Central
-                Serial.println("⏰ Switched to Central Time");
+                // This is a fresh tap - wake up the display
+                Serial.println("👆 Fresh tap detected - waking up display");
+                wakeUpDisplay();
+                return;
             }
-            
-            saveSettings();
-            
-            // Apply new timezone immediately
-            setenv("TZ", settings.timezone_string, 1);
-            tzset();
-            
-            // The timezone change should automatically adjust the displayed time
-            // Force immediate display update
-            updateTimeDisplay();
-            
-            // Print the new time for verification
-            struct tm timeinfo;
-            if (getLocalTime(&timeinfo)) {
-                char timeStr[30];
-                strftime(timeStr, sizeof(timeStr), "%H:%M:%S %Z", &timeinfo);
-                Serial.println("🕐 New time after timezone change: " + String(timeStr));
-                Serial.println("🌞 DST Status: " + String(timeinfo.tm_isdst ? "Active" : "Inactive"));
-            } else {
-                Serial.println("❌ Failed to get time after timezone change");
-            }
-            
-            Serial.println("🔄 Timezone updated with automatic DST handling");
+        }
+
+        // Handle touch hold detection for sleep
+        if (!touch_currently_held) {
+            // Start of a new touch
+            touch_currently_held = true;
+            touch_hold_start_time = current_time;
+            Serial.println("👆 Touch started at: (" + String(touchX) + ", " + String(touchY) + ")");
         } else {
-            // Touch above y=75 - trigger cat excitement
-            uint32_t current_time = millis();
-            
-            Serial.println("👆 Cat area touched (y>=75) at: (" + String(touchX) + ", " + String(touchY) + ") - Getting excited!");
-            
-            // If sleeping, wake up to idle first
-            if (sprite_manager.current_state == ANIM_STATE_IDLE_STAGE4) {
-                Serial.println("😴➡️😐 Waking up from sleep!");
-                sprite_manager_set_state(&sprite_manager, ANIM_STATE_IDLE_STAGE1, current_time);
-            } else if (is_excited) {
-                // Cat is already excited - control brightness instead
-                static int brightness_level = 255;  // Start at full brightness
-                brightness_level -= 25;  // Decrease by 25 each touch
-                if (brightness_level < 25) brightness_level = 255;  // Reset to full when too dim
-                
-                // Set TFT brightness (0-255)
-                analogWrite(TFT_BL, brightness_level);  // Assuming TFT_BL is the backlight pin
-                Serial.println("🔆 Cat is excited - Brightness set to: " + String(brightness_level) + "/255");
-            } else {
-                // Switch to excited state
-                Serial.println("😐➡️😊 Getting excited!");
-                sprite_manager_set_state(&sprite_manager, ANIM_STATE_TYPING_FAST, current_time);  // Use fast typing as "excited"
-                sprite_manager.is_streak_mode = true;  // Happy face
-                is_excited = true;
-                excited_start_time = current_time;
+            // Touch is being held - check if held long enough to sleep
+            uint32_t hold_duration = current_time - touch_hold_start_time;
+            if (hold_duration >= HOLD_TO_SLEEP_DURATION_MS) {
+                Serial.println("💤 Touch held for 5+ seconds - putting display to sleep");
+                setDisplaySleep(true);
+                touch_currently_held = false;  // Reset hold state
+                return;  // Don't process other touch actions
             }
+        }
+        
+        // Normal touch processing (only if not held for sleep)
+        uint32_t hold_duration = current_time - touch_hold_start_time;
+        if (hold_duration < HOLD_TO_SLEEP_DURATION_MS) {
+            // Check if touch is below y=75 (time/DST toggle area) or above y=75 (cat excitement area)
+            bool touched_time_area = (touchY < 75);  // Below y=75 toggles daylight savings
             
-            last_touch_time = current_time;
+            if (touched_time_area) {
+                // Only process timezone change on quick tap (not hold)
+                if (hold_duration < 500) {  // Quick tap
+                    // Touch below y=75 - cycle through common US timezones
+                    Serial.println("🕐 Time area touched (y<75) - Cycling timezone!");
+                    
+                    // Cycle through common US timezones
+                    if (strcmp(settings.timezone_string, "CST6CDT,M3.2.0,M11.1.0") == 0) {
+                        strcpy(settings.timezone_string, "EST5EDT,M3.2.0,M11.1.0");  // Eastern
+                        Serial.println("⏰ Switched to Eastern Time");
+                    } else if (strcmp(settings.timezone_string, "EST5EDT,M3.2.0,M11.1.0") == 0) {
+                        strcpy(settings.timezone_string, "MST7MDT,M3.2.0,M11.1.0");  // Mountain
+                        Serial.println("⏰ Switched to Mountain Time");
+                    } else if (strcmp(settings.timezone_string, "MST7MDT,M3.2.0,M11.1.0") == 0) {
+                        strcpy(settings.timezone_string, "PST8PDT,M3.2.0,M11.1.0");  // Pacific
+                        Serial.println("⏰ Switched to Pacific Time");
+                    } else {
+                        strcpy(settings.timezone_string, "CST6CDT,M3.2.0,M11.1.0");  // Back to Central
+                        Serial.println("⏰ Switched to Central Time");
+                    }
+                    
+                    saveSettings();
+                    
+                    // Apply new timezone immediately
+                    setenv("TZ", settings.timezone_string, 1);
+                    tzset();
+                    
+                    // Force immediate display update
+                    updateTimeDisplay();
+                    
+                    // Print the new time for verification
+                    struct tm timeinfo;
+                    if (getLocalTime(&timeinfo)) {
+                        char timeStr[30];
+                        strftime(timeStr, sizeof(timeStr), "%H:%M:%S %Z", &timeinfo);
+                        Serial.println("�t New time after timezone change: " + String(timeStr));
+                        Serial.println("🌞 DST Status: " + String(timeinfo.tm_isdst ? "Active" : "Inactive"));
+                    } else {
+                        Serial.println("❌ Failed to get time after timezone change");
+                    }
+                    
+                    Serial.println("🔄 Timezone updated with automatic DST handling");
+                }
+            } else {
+                // Touch above y=75 - trigger cat excitement (only on quick tap)
+                if (hold_duration < 500) {  // Quick tap
+                    Serial.println("👆 Cat area touched (y>=75) at: (" + String(touchX) + ", " + String(touchY) + ") - Getting excited!");
+                    
+                    // If sleeping, wake up to idle first
+                    if (sprite_manager.current_state == ANIM_STATE_IDLE_STAGE4) {
+                        Serial.println("😴➡️😐 Waking up from sleep!");
+                        sprite_manager_set_state(&sprite_manager, ANIM_STATE_IDLE_STAGE1, current_time);
+                    } else if (is_excited) {
+                        // Cat is already excited - control brightness instead
+                        static int brightness_level = 255;  // Start at full brightness
+                        brightness_level -= 25;  // Decrease by 25 each touch
+                        if (brightness_level < 25) brightness_level = 255;  // Reset to full when too dim
+                        
+                        // Set TFT brightness (0-255)
+                        analogWrite(TFT_BL, brightness_level);  // Assuming TFT_BL is the backlight pin
+                        Serial.println("🔆 Cat is excited - Brightness set to: " + String(brightness_level) + "/255");
+                    } else {
+                        // Switch to excited state
+                        Serial.println("😐➡️😊 Getting excited!");
+                        sprite_manager_set_state(&sprite_manager, ANIM_STATE_TYPING_FAST, current_time);  // Use fast typing as "excited"
+                        sprite_manager.is_streak_mode = true;  // Happy face
+                        is_excited = true;
+                        excited_start_time = current_time;
+                    }
+                    
+                    last_touch_time = current_time;
+                }
+            }
         }
     } else {
+        // Touch released
         data->state = LV_INDEV_STATE_REL;
+        
+        // Clear the "just went to sleep" flag when touch is released
+        if (just_went_to_sleep) {
+            just_went_to_sleep = false;
+            Serial.println("👆 Touch released - display ready to wake up on next tap");
+        }
+        
+        if (touch_currently_held) {
+            uint32_t hold_duration = current_time - touch_hold_start_time;
+            Serial.println("👆 Touch released after " + String(hold_duration) + "ms");
+            touch_currently_held = false;
+        }
     }
 }
 
@@ -211,6 +269,42 @@ String getTimezoneDisplayName() {
     if (strcmp(settings.timezone_string, "MST7MDT,M3.2.0,M11.1.0") == 0) return "MT";
     if (strcmp(settings.timezone_string, "PST8PDT,M3.2.0,M11.1.0") == 0) return "PT";
     return "??";
+}
+
+// Display sleep control functions
+void setDisplaySleep(bool sleep) {
+    if (sleep && !display_sleeping) {
+        Serial.println("💤 Display going to sleep...");
+        display_sleeping = true;
+        just_went_to_sleep = true;  // Set flag to prevent immediate wake up
+        
+        // Turn off backlight
+        analogWrite(TFT_BL, 0);  // Set backlight to 0
+        
+        // Optionally turn off the display entirely
+        tft.writecommand(0x10);  // Sleep mode command for most TFT displays
+        
+    } else if (!sleep && display_sleeping) {
+        Serial.println("👁️ Display waking up...");
+        display_sleeping = false;
+        just_went_to_sleep = false;  // Clear the flag
+        
+        // Wake up display
+        tft.writecommand(0x11);  // Wake up command
+        delay(120);  // Wait for display to wake up
+        
+        // Restore backlight
+        analogWrite(TFT_BL, 255);  // Full brightness
+        
+        // Force screen refresh
+        lv_obj_invalidate(lv_scr_act());
+    }
+}
+
+void wakeUpDisplay() {
+    if (display_sleeping) {
+        setDisplaySleep(false);
+    }
 }
 
 // Update time display  
